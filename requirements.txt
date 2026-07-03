@@ -1,0 +1,23 @@
+# ===========================================================
+# Core job scraping
+# ===========================================================
+python-jobspy
+
+# ===========================================================
+# AI providers
+# ===========================================================
+# Google Gemini (new SDK - uses 'from google import genai')
+google-genai
+
+# Groq (last fallback)
+groq
+
+# OpenRouter (OpenAI-compatible, used as Fallback 1 & 2)
+openai
+
+# ===========================================================
+# Utilities
+# ===========================================================
+pandas
+requests
+python-dotenv

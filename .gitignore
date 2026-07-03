@@ -1,0 +1,22 @@
+# Python virtual environment (never commit this)
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Credentials (NEVER commit these)
+.env
+env.sh
+
+# Runtime data
+jobs.db
+cron.log
+provider_state.json
+run_local.sh
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+resume-short.txt

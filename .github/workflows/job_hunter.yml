@@ -1,0 +1,85 @@
+name: 🔍 AI Job Hunter
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schedule (GitHub Actions uses UTC; IST = UTC + 5:30)
+#
+# Weekdays (Mon–Fri): every 2h from 09:30–23:30 IST
+#   IST  09:30 11:30 13:30 15:30 17:30 19:30 21:30 23:30
+#   UTC  04:00 06:00 08:00 10:00 12:00 14:00 16:00 18:00
+#
+# Weekends (Sat–Sun): 12:00 PM, 7:00 PM, 11:30 PM IST
+#   IST  12:00  19:00  23:30
+#   UTC  06:30  13:30  18:00
+#
+# Note: GitHub Actions schedules can run a few minutes late under load.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # Weekdays — 8 runs
+    - cron: "0 4 * * 1-5"     # 09:30 IST
+    - cron: "0 6 * * 1-5"     # 11:30 IST
+    - cron: "0 8 * * 1-5"     # 13:30 IST
+    - cron: "0 10 * * 1-5"    # 15:30 IST
+    - cron: "0 12 * * 1-5"    # 17:30 IST
+    - cron: "0 14 * * 1-5"    # 19:30 IST
+    - cron: "0 16 * * 1-5"    # 21:30 IST
+    - cron: "0 18 * * 1-5"    # 23:30 IST
+    # Weekends — 3 runs
+    - cron: "30 6 * * 0,6"    # 12:00 PM IST
+    - cron: "30 13 * * 0,6"   # 07:00 PM IST
+    - cron: "0 18 * * 0,6"    # 11:30 PM IST
+
+  # Allow triggering manually from the GitHub Actions UI for testing
+  workflow_dispatch:
+
+# Only ever run one instance at a time (prevents overlapping runs)
+concurrency:
+  group: job-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    name: Hunt & Notify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── 3. Install dependencies ──────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore jobs.db from cache ────────────────────────────────────
+      # This keeps the deduplication database persistent across runs
+      # without committing it to git.
+      - name: Restore jobs.db cache
+        uses: actions/cache@v4
+        with:
+          path: jobs.db
+          key: jobs-db-${{ github.run_id }}
+          restore-keys: |
+            jobs-db-
+
+      # ── 5. Run the job hunter ─────────────────────────────────────────────
+      - name: Run job_hunter.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python job_hunter.py
+
+      # ── 6. Save updated jobs.db to cache ─────────────────────────────────
+      # The cache@v4 step above automatically saves after the job ends.
+      # No explicit save step needed.
