@@ -54,8 +54,9 @@ HOURS_OLD = 24              # Look at jobs posted in the last 24 hours
                             # Overnight gap (23:30→09:30) has near-zero SWE activity in India.
 
 # Sites to scrape — ordered by India SWE relevance
-# zip_recruiter / bayt / bdjobs excluded (US / Middle East / Bangladesh focused)
-SCRAPE_SITES = ["linkedin", "naukri", "indeed", "glassdoor"]
+# naukri:    blocked (406 recaptcha required)
+# glassdoor: blocked (403 + location format unsupported)
+SCRAPE_SITES = ["linkedin", "indeed"]
 
 # Search terms — cast a wider net across role titles
 # Deduplication by URL ensures the same posting isn't analysed twice
