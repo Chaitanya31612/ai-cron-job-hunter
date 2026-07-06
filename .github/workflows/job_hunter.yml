@@ -73,6 +73,7 @@ jobs:
       # ── 5. Run the job hunter ─────────────────────────────────────────────
       - name: Run job_hunter.py
         env:
+          TZ: Asia/Kolkata             # All log timestamps will show in IST
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

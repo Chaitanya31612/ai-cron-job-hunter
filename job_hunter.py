@@ -85,7 +85,7 @@ REJECT_KEYWORDS = [
     r"embedded engineer", r"firmware engineer",
     r"android developer", r"ios developer", r"mobile developer",
     # Too senior
-    r"10\+\s*years?", r"12\+\s*years?", r"15\+\s*years?",
+    r"8\+\s*years?", r"10\+\s*years?", r"12\+\s*years?", r"15\+\s*years?",
 ]
 
 REQUIRE_ANY_KEYWORDS = [
