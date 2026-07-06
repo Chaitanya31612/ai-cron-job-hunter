@@ -315,10 +315,10 @@ def save_job(conn: sqlite3.Connection, url: str, title: str,
 # ─────────────────────────────────────────────
 def fetch_jobs() -> pd.DataFrame:
     """
-    Scrape jobs from all configured sites and search terms in parallel.
+    Scrape jobs from all configured sites and search terms sequentially.
 
     Strategy:
-    - Each (site, search_term) pair is scraped independently.
+    - Each (site, search_term) pair is scraped one at a time.
     - Per-site failures are caught and logged without aborting the whole run.
       A flaky Naukri scrape won't kill LinkedIn results.
     - Results are deduplicated by job_url across all batches.
