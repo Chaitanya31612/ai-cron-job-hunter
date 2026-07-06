@@ -66,8 +66,11 @@ SEARCH_TERMS = [
     "full stack developer",
 ]
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+# High-priority channel (score 8+) — your "apply now" queue
+TELEGRAM_CHAT_ID_HIGH  = os.getenv("TELEGRAM_CHAT_ID_HIGH", "")
+# Secondary channel (score 6-7) — your "review later" queue
+TELEGRAM_CHAT_ID_LOW   = os.getenv("TELEGRAM_CHAT_ID_LOW", "")
 
 # ─────────────────────────────────────────────
 # Pre-filter  (keyword-based fast-reject)
@@ -260,10 +263,18 @@ Personal projects (portfolio: https://chaitanyagupta.netlify.app/):
 
     # ── Location & logistics ─────────────────────────────────────────────────
     "location_preferences": [
-        "Remote (preferred)",
+        "Remote — India or US",
         "Hybrid — Noida / Delhi NCR",
         "Hybrid — Bengaluru (open to relocation)",
+        "In-office — Noida / Delhi NCR",
+        "In-office — Bengaluru (open to relocation)",
     ],
+    "location_note": (
+        "Do NOT penalise roles for being remote-US, hybrid, or in-office. "
+        "The candidate is open to all of these. Only flag location as a concern "
+        "if the role explicitly requires being physically present outside India "
+        "(e.g. on-site US/UK only with no remote option)."
+    ),
     "target_salary_range": "20–30 LPA",
 
     # ── Dream companies (high priority if matching) ──────────────────────────
@@ -407,6 +418,7 @@ Candidate Profile:
 - Stack note: {USER_PROFILE['note_on_stack']}
 - Avoid these roles: {', '.join(USER_PROFILE['avoid'])}
 - Location preferences: {', '.join(USER_PROFILE['location_preferences'])}
+- Location note: {USER_PROFILE['location_note']}
 - Dream companies (higher weight if matched): {', '.join(USER_PROFILE['dream_companies'])}
 
 Experience Summary:
@@ -418,12 +430,20 @@ Scoring Rules:
 - Score 1–5: Poor fit — wrong stack, too senior/junior, domain mismatch.
 - Score 0: Explicitly in the avoid list (e.g. Python-only, .NET, DevOps-only, Data Science).
 
+Additionally, provide a brief company overview and estimated salary range for this role.
+For salary: use any known data about this company's pay bands for similar roles in India.
+For company overview: mention company type, size (if known), domain, and reputation.
+If you are uncertain, give a best-effort estimate and prefix with "~" (e.g. "~18–25 LPA").
+These are supplementary hints — the candidate will do their own research if interested.
+
 Return ONLY a valid JSON object — no markdown, no preamble:
 {{
     "fit_score": <integer 0–10>,
     "synopsis": "<2–3 sentence overview of the role and what it requires>",
     "why_it_fits": "<concise paragraph on alignment or misalignment with the candidate>",
     "dream_company_match": <true if company is in dream list, else false>,
+    "company_overview": "<1–2 sentences: company type, domain, size/stage, and reputation if known — or 'Not enough info' if unknown>",
+    "salary_range": "<estimated salary range in LPA for this role at this company in India — prefix with ~ if uncertain, or 'Not available' if no data>",
     "resume_suggestions": "<specific, actionable advice on what to emphasise or rearrange in the resume for this job — or 'No changes needed' if already well aligned>"
 }}
 """
@@ -468,43 +488,79 @@ def analyze_job(title: str, company: str, description: str) -> tuple | None:
 # ─────────────────────────────────────────────
 # Telegram Notifier
 # ─────────────────────────────────────────────
+def _post_telegram(chat_id: str, text: str, title: str, company: str) -> None:
+    """Low-level helper — posts a message to a specific chat_id."""
+    r = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False,
+        },
+        timeout=10,
+    )
+    r.raise_for_status()
+    logger.info(f"📬 Telegram sent for: {title} @ {company}")
+
+
 def send_telegram(title: str, company: str, url: str,
                   analysis: dict, provider: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials not set — skipping notification")
+    """
+    Routes the notification to the correct Telegram channel based on score:
+      - score 8+  → TELEGRAM_CHAT_ID_HIGH  ("apply now" queue)
+      - score 6-7 → TELEGRAM_CHAT_ID_LOW   ("review later" queue)
+    Falls back gracefully if a channel ID is not configured.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping notification")
         return
 
     score = analysis["fit_score"]
+    is_hot = score >= 8
+
+    # Pick the right channel
+    if is_hot:
+        chat_id  = TELEGRAM_CHAT_ID_HIGH
+        channel  = "high-priority"
+    else:
+        chat_id  = TELEGRAM_CHAT_ID_LOW
+        channel  = "regular"
+
+    if not chat_id:
+        logger.warning(
+            f"TELEGRAM_CHAT_ID_{('HIGH' if is_hot else 'LOW')} not set — "
+            f"skipping notification for '{title}'"
+        )
+        return
+
     star = "🌟" if analysis.get("dream_company_match") else ""
-    bar = "🟢" * min(score, 10) + "⬜" * (10 - min(score, 10))
+    bar  = "🟢" * min(score, 10) + "⬜" * (10 - min(score, 10))
+
+    company_overview = analysis.get("company_overview", "Not available")
+    salary_range     = analysis.get("salary_range", "Not available")
+
+    label = "🔥 *HOT MATCH*" if is_hot else "👀 *Good Match*"
 
     text = (
-        f"{star}{'🔥' if score >= 8 else '👀'} *New Job Match — {score}/10*\n"
+        f"{star}{label} — {score}/10\n"
         f"{bar}\n\n"
         f"*{title}*\n"
         f"🏢 {company}\n\n"
         f"📝 *Synopsis*\n{analysis['synopsis']}\n\n"
         f"💡 *Why it fits*\n{analysis['why_it_fits']}\n\n"
+        f"🏦 *Company*\n{company_overview}\n\n"
+        f"💰 *Est\. Salary* \(AI best\-effort\)\n{salary_range}\n\n"
         f"📄 *Resume tip*\n{analysis['resume_suggestions']}\n\n"
         f"🤖 _Analysed by: {provider}_\n\n"
         f"[Apply Now →]({url})"
     )
 
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": False,
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        logger.info(f"📬 Telegram sent for: {title} @ {company}")
+        _post_telegram(chat_id, text, title, company)
+        logger.info(f"  ↳ Routed to [{channel}] channel (score {score})")
     except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
+        logger.error(f"Telegram send failed ({channel}): {e}")
 
 
 # ─────────────────────────────────────────────
@@ -523,7 +579,12 @@ def main() -> None:
         conn.close()
         return
 
-    new_count = processed_count = notified_count = 0
+    new_count = processed_count = notified_count = skipped_dupe_count = 0
+
+    # In-run dedup by (title, company) — catches same job posted under
+    # different URLs (e.g. same Scoutit role on LinkedIn vs Indeed, or
+    # scraped by multiple search terms returning slightly different URLs).
+    seen_title_company: set[str] = set()
 
     for _, row in jobs_df.iterrows():
         url     = str(row.get("job_url", "")).strip()
@@ -538,8 +599,16 @@ def main() -> None:
             processed_count += 1
             continue
 
+        # Secondary dedup: same title+company already seen this run
+        tc_key = f"{title.lower()}||{company.lower()}"
+        if tc_key in seen_title_company:
+            skipped_dupe_count += 1
+            logger.info(f"  ↳ Duplicate in-run ({title} @ {company}) — skipped | url: {url}")
+            continue
+        seen_title_company.add(tc_key)
+
         new_count += 1
-        logger.info(f"Analysing: {title} @ {company}")
+        logger.info(f"Analysing: {title} @ {company} | url: {url}")
 
         result = analyze_job(title, company, desc)
         if result is None:
@@ -561,6 +630,7 @@ def main() -> None:
     logger.info(
         f"Run complete — "
         f"{new_count} new | {processed_count} already seen | "
+        f"{skipped_dupe_count} in-run dupes skipped | "
         f"{notified_count} notifications sent"
     )
     logger.info("=" * 55)
