@@ -1,9 +1,10 @@
 """
 job_hunter.py — AI Job Hunter Orchestrator
 ==========================================
-Scrapes developer job listings from LinkedIn & Indeed (India), deduplicates
-them via SQLite, runs LLM analysis against the user profile, and fires an
-instant Telegram notification for any job scoring >= FIT_THRESHOLD.
+Scrapes developer job listings from LinkedIn, Naukri, Indeed, and Glassdoor
+(India), deduplicates them via SQLite, runs LLM analysis against the user
+profile, and fires an instant Telegram notification for any job scoring
+>= FIT_THRESHOLD.
 
 Run manually:
     source venv/bin/activate
@@ -11,11 +12,13 @@ Run manually:
 
 Scheduled via:
     - GitHub Actions (cloud, recommended) — see .github/workflows/job_hunter.yml
-    - Local cron via setup_cron.sh (fallback / learning)
+    - Local cron via setup_cron.sh (fallback)
 """
 
 import os
+import re
 import json
+import time
 import sqlite3
 import logging
 import requests
@@ -45,12 +48,93 @@ DB_PATH = SCRIPT_DIR / "jobs.db"
 # Configuration
 # ─────────────────────────────────────────────
 FIT_THRESHOLD = 6           # Only notify for jobs scoring >= this out of 10
-RESULTS_PER_SITE = 15       # How many listings to pull per site per run
-HOURS_OLD = 72              # Scrape jobs posted within the last N hours
-                            # (72h covers the gap between run windows)
+RESULTS_PER_SITE = 20       # Listings to pull per site per search term
+HOURS_OLD = 24              # Look at jobs posted in the last 24 hours
+                            # Clean daily boundary; dedup via jobs.db handles overlap.
+                            # Overnight gap (23:30→09:30) has near-zero SWE activity in India.
+
+# Sites to scrape — ordered by India SWE relevance
+# zip_recruiter / bayt / bdjobs excluded (US / Middle East / Bangladesh focused)
+SCRAPE_SITES = ["linkedin", "naukri", "indeed", "glassdoor"]
+
+# Search terms — cast a wider net across role titles
+# Deduplication by URL ensures the same posting isn't analysed twice
+SEARCH_TERMS = [
+    "software engineer",
+    "backend engineer",
+    "full stack developer",
+]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ─────────────────────────────────────────────
+# Pre-filter  (keyword-based fast-reject)
+# Runs BEFORE any LLM call — costs zero tokens.
+# If a job description contains any REJECT keyword, it's scored 0 and skipped.
+# If it contains NONE of the REQUIRE_ANY keywords, it's also skipped.
+# Saves ~25-40% of LLM calls on a typical run.
+# ─────────────────────────────────────────────
+REJECT_KEYWORDS = [
+    # Wrong stack
+    r"\.net\b", r"\bc#\b", r"asp\.net", r"\bdjango\b", r"\bflask\b",
+    r"\bfastapi\b", r"\blaravel\b", r"\bphp\b",
+    # Wrong domain
+    r"data scientist", r"machine learning engineer", r"ml engineer",
+    r"devops engineer", r"\bsre\b", r"site reliability",
+    r"embedded engineer", r"firmware engineer",
+    r"android developer", r"ios developer", r"mobile developer",
+    # Too senior
+    r"10\+\s*years?", r"12\+\s*years?", r"15\+\s*years?",
+]
+
+REQUIRE_ANY_KEYWORDS = [
+    "javascript", "typescript", "node", "react", "vue", "next",
+    "ruby", "rails", "java", "spring",
+    "backend", "full.?stack", "fullstack",
+    "software engineer", "software developer",
+    "rest api", "graphql", "microservice",
+]
+
+
+def quick_filter(title: str, description: str) -> tuple[bool, str]:
+    """
+    Fast keyword-based pre-screen before spending an LLM call.
+    Returns (should_analyse, reason).
+    """
+    text = (title + " " + description).lower()
+
+    for pattern in REJECT_KEYWORDS:
+        if re.search(pattern, text):
+            return False, f"pre-filter reject: '{pattern}'"
+
+    if not any(re.search(kw, text) for kw in REQUIRE_ANY_KEYWORDS):
+        return False, "pre-filter reject: no relevant tech keywords found"
+
+    return True, "passed"
+
+
+# ─────────────────────────────────────────────
+# Rate limiter
+# Gemini 3.1 Flash-Lite free tier: 15 RPM = 1 req per 4s minimum.
+# Without this, rapid-fire calls hit 429 immediately and cascade to
+# OpenRouter / Groq — burning through their quotas too.
+# A 4s floor keeps us comfortably under the 15 RPM ceiling.
+# ─────────────────────────────────────────────
+_last_llm_call: float = 0.0
+LLM_MIN_INTERVAL_SEC = 4.0   # seconds between LLM calls
+
+
+def rate_limited_analyze(content: str, prompt: str):
+    """Wrap analyze_with_fallback with a minimum inter-call delay."""
+    global _last_llm_call
+    elapsed = time.monotonic() - _last_llm_call
+    if elapsed < LLM_MIN_INTERVAL_SEC:
+        wait = LLM_MIN_INTERVAL_SEC - elapsed
+        logger.debug(f"Rate limiter: sleeping {wait:.1f}s")
+        time.sleep(wait)
+    _last_llm_call = time.monotonic()
+    return AIAnalyzerFactory.analyze_with_fallback(content, prompt)
 
 # ─────────────────────────────────────────────
 # User Profile  (built from resume-short.txt)
@@ -186,6 +270,7 @@ Personal projects (portfolio: https://chaitanyagupta.netlify.app/):
         "Razorpay", "CRED", "Groww", "Atlassian", "Freshworks",
         "BrowserStack", "Chargebee", "Stripe", "Postman", "Setu",
         "Zepto", "Urban Company", "Meesho", "Swiggy", "Zomato",
+        "Microsoft", "Amazon", "Google", "Uber"
     ],
 }
 
@@ -229,22 +314,79 @@ def save_job(conn: sqlite3.Connection, url: str, title: str,
 # Scraper
 # ─────────────────────────────────────────────
 def fetch_jobs() -> pd.DataFrame:
-    logger.info("Scraping job listings …")
-    try:
-        jobs = scrape_jobs(
-            site_name=["indeed", "linkedin"],
-            search_term="software engineer",
-            location="India",
-            results_wanted=RESULTS_PER_SITE,
-            country_indeed="india",
-            hours_old=HOURS_OLD,
-            linkedin_fetch_description=True,
-        )
-        logger.info(f"Fetched {len(jobs)} listings total")
-        return jobs
-    except Exception as e:
-        logger.error(f"Scraping failed: {e}")
+    """
+    Scrape jobs from all configured sites and search terms in parallel.
+
+    Strategy:
+    - Each (site, search_term) pair is scraped independently.
+    - Per-site failures are caught and logged without aborting the whole run.
+      A flaky Naukri scrape won't kill LinkedIn results.
+    - Results are deduplicated by job_url across all batches.
+    - Final DataFrame is sorted newest-first so the freshest listings
+      are processed (and Telegram'd) first.
+    """
+    logger.info(
+        f"Scraping {len(SCRAPE_SITES)} sites × {len(SEARCH_TERMS)} terms "
+        f"(last {HOURS_OLD}h, {RESULTS_PER_SITE} results/batch) …"
+    )
+
+    all_frames: list[pd.DataFrame] = []
+    seen_urls: set[str] = set()   # cross-batch URL dedup before DB check
+
+    for term in SEARCH_TERMS:
+        for site in SCRAPE_SITES:
+            try:
+                logger.info(f"  └─ [{site}] '{term}' …")
+                batch = scrape_jobs(
+                    site_name=[site],
+                    search_term=term,
+                    location="India",
+                    results_wanted=RESULTS_PER_SITE,
+                    country_indeed="india",
+                    hours_old=HOURS_OLD,
+                    linkedin_fetch_description=(site == "linkedin"),
+                )
+
+                if batch is None or batch.empty:
+                    logger.info(f"     → 0 results")
+                    continue
+
+                # Deduplicate within this run's accumulated results
+                if "job_url" in batch.columns:
+                    before = len(batch)
+                    batch = batch[~batch["job_url"].isin(seen_urls)]
+                    batch = batch.dropna(subset=["job_url"])
+                    seen_urls.update(batch["job_url"].tolist())
+                    dupes = before - len(batch)
+                    logger.info(
+                        f"     → {len(batch)} new"
+                        + (f" ({dupes} cross-batch dupes skipped)" if dupes else "")
+                    )
+
+                all_frames.append(batch)
+
+            except Exception as e:
+                # Log the failure but continue with remaining sites/terms
+                logger.warning(f"     ⚠️  [{site}] '{term}' failed: {e}")
+                continue
+
+    if not all_frames:
+        logger.warning("No listings returned from any site/term combination.")
         return pd.DataFrame()
+
+    combined = pd.concat(all_frames, ignore_index=True)
+
+    # Sort newest-first — freshest jobs processed and notified first
+    if "date_posted" in combined.columns:
+        combined = combined.sort_values(
+            "date_posted", ascending=False, na_position="last"
+        )
+        combined = combined.reset_index(drop=True)
+
+    logger.info(
+        f"Total: {len(combined)} unique listings across all sites — newest first"
+    )
+    return combined
 
 
 # ─────────────────────────────────────────────
@@ -286,14 +428,20 @@ Return ONLY a valid JSON object — no markdown, no preamble:
 """
 
 
-def analyze_job(title: str, company: str, description: str) -> dict | None:
+def analyze_job(title: str, company: str, description: str) -> tuple | None:
     if not description or len(description.strip()) < 50:
         logger.warning(f"Skipping '{title}' — description too short or missing")
         return None
 
+    # Pre-filter: keyword check before spending any LLM tokens
+    ok, reason = quick_filter(title, description)
+    if not ok:
+        logger.info(f"  ↳ {reason} — skipped LLM")
+        return None
+
     job_content = f"Job Title: {title}\nCompany: {company}\n\nJob Description:\n{description}"
 
-    response = AIAnalyzerFactory.analyze_with_fallback(
+    response = rate_limited_analyze(
         content=job_content,
         prompt=ANALYSIS_PROMPT,
     )
@@ -304,14 +452,15 @@ def analyze_job(title: str, company: str, description: str) -> dict | None:
 
     try:
         raw = response.content.strip()
-        # Strip markdown code fences if model returns them despite the prompt
+        # Strip markdown code fences robustly
+        # Handles: ```json\n{...}\n``` and ```\n{...}\n```
         if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)  # strip opening fence + lang tag
+            raw = re.sub(r"\n?```$", "", raw.strip())    # strip closing fence
+            raw = raw.strip()
         return json.loads(raw), response.provider.value
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error for '{title}': {e}\nRaw: {response.content[:200]}")
+        logger.error(f"JSON parse error for '{title}': {e}\nRaw: {response.content[:300]}")
         return None
 
 
