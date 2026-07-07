@@ -48,7 +48,7 @@ DB_PATH = SCRIPT_DIR / "jobs.db"
 # Configuration
 # ─────────────────────────────────────────────
 FIT_THRESHOLD = 6           # Only notify for jobs scoring >= this out of 10
-RESULTS_PER_SITE = 20       # Listings to pull per site per search term
+RESULTS_PER_SITE = 60       # Listings to pull per site per search term
 HOURS_OLD = 24              # Look at jobs posted in the last 24 hours
                             # Clean daily boundary; dedup via jobs.db handles overlap.
                             # Overnight gap (23:30→09:30) has near-zero SWE activity in India.
@@ -64,6 +64,8 @@ SEARCH_TERMS = [
     "software engineer",
     "backend engineer",
     "full stack developer",
+    "full stack builder",
+    "product engineer",
 ]
 
 TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -101,16 +103,78 @@ REQUIRE_ANY_KEYWORDS = [
 ]
 
 
-def quick_filter(title: str, description: str) -> tuple[bool, str]:
+VALUABLE_COMPANIES = {
+    # Big Tech / Tier 1 Global
+    "google", "microsoft", "amazon", "meta", "apple", "netflix", "uber", "stripe", "adobe", "salesforce", "oracle",
+    "atlassian", "coinbase", "linkedin", "snowflake", "twilio", "zoom", "airbnb", "github", "gitlab", "spacex", "tesla",
+    "paypal", "stripe", "adyen", "block", "square", "twitter", "x.com", "reddit", "pinterest", "snapchat", "snap", "figma",
+    "canva", "bytedance", "tiktok", "grab", "gojek", "shopee", "sea group", "ibm",
+
+    # Indian Tier 1 & 2 Tech Leaders / Unicorns / Media
+    "flipkart", "swiggy", "zomato", "razorpay", "cred", "phonepe", "ola", "groww", "zerodha", "paytm", "nykaa", "meesho",
+    "zepto", "urban company", "blinkit", "dream11", "inmobi", "postman", "browserstack", "freshworks", "chargebee", "jiostar",
+    "jio", "reliance", "sharechat", "dailyhunt", "licious", "spinny", "cars24", "cult.fit", "upstox", "coindcx", "coinswitch",
+    "slice", "jupiter", "fi money", "uni", "bharatpe", "onecard", "khatabook", "rupeek", "turtlemint", "digit", "acko",
+    "cleartax", "media.net", "pocket aces", "unacademy", "byju's", "upgrad", "eruditus", "simplilearn", "physics wallah",
+    "lenskart", "nykaa", "pharmeasy", "1mg", "tata 1mg", "curefit", "myntra", "ajio", "dunzo", "portcast", "shadowfax",
+    "delhivery", "shiprocket", "elasticrun", "ninjacart", "dehaat", "waycool", "agrostar", "leadsquared", "darwinbox",
+    "highradius", "amagi", "hasura", "innovaccer", "fractal", "mu sigma", "gupshup", "route mobile", "yellow.ai",
+
+    # Tier 2 Global MNCs (R&D Centers in India)
+    "cisco", "intel", "broadcom", "vmware", "intuit", "dell", "sap", "siemens", "hp", "ebay", "expedia", "booking.com",
+    "yahoo", "qualcomm", "nvidia", "amd", "arm", "netapp", "juniper", "nutanix", "palo alto", "fortinet", "f5", "walmart",
+    "target", "tesco", "goldman sachs", "morgan stanley", "jp morgan", "jpmorgan", "citi", "barclays", "hsbc",
+    "standard chartered", "fidelity", "blackrock", "visa", "mastercard", "american express", "capital one", "bofa",
+    "bank of america", "wells fargo", "credit suisse", "ubs", "deutsche bank", "bny mellon", "societe generale",
+    "mercedes-benz", "bmw", "audi", "ford", "general motors", "toyota", "honda", "hyundai", "renault", "nissan",
+    "philips", "honeywell", "bosch", "samsung", "sony", "lg", "panasonic", "hitachi", "toshiba", "ge", "general electric",
+    "schneider electric", "abb", "alstom", "johnson & johnson", "novartis", "roche", "pfizer", "merck",
+    "astrazeneca", "gsk", "sanofi", "bayer", "eli lilly", "abbvie", "bristol myers", "amgen", "gilead", "biogen",
+
+    # Mid-Tier / Tech Consultancies with high bar
+    "thoughtworks", "epam", "nagarro", "sapient", "publicis", "accenture", "capgemini", "cognizant", "infosys", "wipro",
+    "tcs", "hcl", "tech mahindra", "l&t", "larsen", "mindtree", "persistent", "coforge", "mphasis", "virtusa", "ust",
+    "hexaware", "zensar", "cybage", "tata elxsi", "ltimindtree"
+}
+
+
+def is_valuable_company(company: str) -> bool:
+    c = company.lower().strip()
+    
+    # Short names that could accidentally match substrings of other words (e.g. "dell" in "deloitte", "jio" in "jiostar")
+    short_companies = {
+        "jio", "lg", "hp", "ge", "abb", "tcs", "l&t", "sap", "gsk", "ubs", 
+        "bofa", "f5", "arm", "amd", "p&g", "citi", "dell", "ford", "hcl", "ibm"
+    }
+    
+    # Tokenize words using boundaries
+    tokens = re.findall(r"\b[a-z0-9&']+\b", c)
+    
+    for vc in VALUABLE_COMPANIES:
+        if vc in short_companies:
+            if vc in tokens:
+                return True
+        else:
+            if vc in c:
+                return True
+    return False
+
+
+def quick_filter(title: str, company: str, description: str) -> tuple[bool, str]:
     """
     Fast keyword-based pre-screen before spending an LLM call.
     Returns (should_analyse, reason).
     """
     text = (title + " " + description).lower()
 
+    # Still respect hard reject keywords (wrong stack, wrong domain, too senior)
     for pattern in REJECT_KEYWORDS:
         if re.search(pattern, text):
             return False, f"pre-filter reject: '{pattern}'"
+
+    # Bypass tech keyword check if the company is recognized as valuable/tier-1/2/3
+    if is_valuable_company(company):
+        return True, "passed (valuable company bypass)"
 
     if not any(re.search(kw, text) for kw in REQUIRE_ANY_KEYWORDS):
         return False, "pre-filter reject: no relevant tech keywords found"
@@ -455,7 +519,7 @@ def analyze_job(title: str, company: str, description: str) -> tuple | None:
         return None
 
     # Pre-filter: keyword check before spending any LLM tokens
-    ok, reason = quick_filter(title, description)
+    ok, reason = quick_filter(title, company, description)
     if not ok:
         logger.info(f"  ↳ {reason} — skipped LLM")
         return None
@@ -550,7 +614,7 @@ def send_telegram(title: str, company: str, url: str,
         f"📝 *Synopsis*\n{analysis['synopsis']}\n\n"
         f"💡 *Why it fits*\n{analysis['why_it_fits']}\n\n"
         f"🏦 *Company*\n{company_overview}\n\n"
-        f"💰 *Est\. Salary* \(AI best\-effort\)\n{salary_range}\n\n"
+        f"💰 *Est. Salary* (AI best-effort)\n{salary_range}\n\n"
         f"📄 *Resume tip*\n{analysis['resume_suggestions']}\n\n"
         f"🤖 _Analysed by: {provider}_\n\n"
         f"[Apply Now →]({url})"
