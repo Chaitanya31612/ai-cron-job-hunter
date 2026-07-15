@@ -370,18 +370,81 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
+def normalize_url(url: str) -> str:
+    """
+    Normalizes a job URL to a canonical format to prevent duplicate processing
+    due to dynamic query parameters.
+    """
+    url = url.strip()
+    if not url:
+        return ""
+    
+    # 1. LinkedIn Job ID extraction
+    # Patterns: 
+    # - https://www.linkedin.com/jobs/view/1234567890/
+    # - https://in.linkedin.com/jobs/view/1234567890
+    # - https://www.linkedin.com/jobs/view/1234567890?refId=...
+    # - https://www.linkedin.com/jobs/collections/recommended/?currentJobId=1234567890
+    linkedin_view_match = re.search(r"linkedin\.com/(?:jobs/)?view/(\d+)", url, re.IGNORECASE)
+    if linkedin_view_match:
+        return f"linkedin:{linkedin_view_match.group(1)}"
+        
+    linkedin_query_match = re.search(r"currentJobId=(\d+)", url, re.IGNORECASE)
+    if linkedin_query_match:
+        return f"linkedin:{linkedin_query_match.group(1)}"
+        
+    # 2. Indeed Job ID extraction
+    # Patterns:
+    # - https://in.indeed.com/viewjob?jk=f8f91f438e767fcd
+    # - https://in.indeed.com/rc/clk?jk=f8f91f438e767fcd
+    indeed_match = re.search(r"jk=([a-zA-Z0-9]+)", url, re.IGNORECASE)
+    if indeed_match:
+        return f"indeed:{indeed_match.group(1)}"
+        
+    # 3. Fallback: strip query parameters and trailing slashes, remove protocol
+    clean_url = url.split("?")[0].rstrip("/")
+    clean_url = re.sub(r"^https?://(www\.)?", "", clean_url, flags=re.IGNORECASE)
+    return clean_url.lower()
+
+
 def is_processed(conn: sqlite3.Connection, url: str) -> bool:
-    return bool(conn.execute(
-        "SELECT 1 FROM processed_jobs WHERE job_url = ?", (url,)
-    ).fetchone())
+    norm_url = normalize_url(url)
+    cursor = conn.execute(
+        "SELECT 1 FROM processed_jobs WHERE job_url = ? OR job_url = ?",
+        (url, norm_url)
+    )
+    return bool(cursor.fetchone())
+
+
+def is_title_company_processed(conn: sqlite3.Connection, title: str, company: str) -> bool:
+    """
+    Checks if a job with the same (case-insensitive) title and company has been
+    processed in the last 14 days to prevent duplicate notifications for reposted roles.
+    """
+    t = title.lower().strip()
+    c = company.lower().strip()
+    if not t or not c or t == "unknown" or c == "unknown":
+        return False
+        
+    cursor = conn.execute(
+        """
+        SELECT 1 FROM processed_jobs 
+        WHERE LOWER(title) = ? AND LOWER(company) = ? 
+        AND processed_at >= datetime('now', '-14 days')
+        LIMIT 1
+        """,
+        (t, c)
+    )
+    return bool(cursor.fetchone())
 
 
 def save_job(conn: sqlite3.Connection, url: str, title: str,
              company: str, score: int, provider: str) -> None:
+    norm_url = normalize_url(url)
     conn.execute(
         "INSERT OR IGNORE INTO processed_jobs "
         "(job_url, title, company, score, provider) VALUES (?,?,?,?,?)",
-        (url, title, company, score, provider)
+        (norm_url if norm_url else url, title, company, score, provider)
     )
     conn.commit()
 
@@ -493,6 +556,12 @@ Scoring Rules:
 - Score 6–7: Decent match, some gaps but learnable. Worth considering.
 - Score 1–5: Poor fit — wrong stack, too senior/junior, domain mismatch.
 - Score 0: Explicitly in the avoid list (e.g. Python-only, .NET, DevOps-only, Data Science).
+
+Ruby on Rails (RoR) Bias (CRITICAL):
+- Ruby on Rails is the candidate's primary and working experience for the past 3 years.
+- There are fewer RoR opportunities, so they are extremely important to the candidate.
+- You MUST apply a strong positive bias to any role that mentions or requires Ruby on Rails.
+- If the role lists Ruby on Rails or Ruby as a key skill/technology, automatically score it 8 or higher (unless it is a senior role requiring >5 YOE, or is explicitly in the avoid list), and explain this core expertise match in "why_it_fits".
 
 Additionally, provide a brief company overview and estimated salary range for this role.
 For salary: use any known data about this company's pay bands for similar roles in India.
@@ -651,43 +720,67 @@ def main() -> None:
     seen_title_company: set[str] = set()
 
     for _, row in jobs_df.iterrows():
-        url     = str(row.get("job_url", "")).strip()
-        title   = str(row.get("title", "Unknown")).strip()
-        company = str(row.get("company", "Unknown")).strip()
-        desc    = str(row.get("description", "")).strip()
+        try:
+            url     = str(row.get("job_url", "")).strip()
+            title   = str(row.get("title", "Unknown")).strip()
+            company = str(row.get("company", "Unknown")).strip()
+            desc    = str(row.get("description", "")).strip()
 
-        if not url:
+            if not url:
+                continue
+
+            if is_processed(conn, url):
+                processed_count += 1
+                continue
+
+            # Secondary dedup: same title+company already seen this run
+            tc_key = f"{title.lower()}||{company.lower()}"
+            if tc_key in seen_title_company:
+                skipped_dupe_count += 1
+                logger.info(f"  ↳ Duplicate in-run ({title} @ {company}) — skipped | url: {url}")
+                continue
+            seen_title_company.add(tc_key)
+
+            # Historical title+company check
+            if is_title_company_processed(conn, title, company):
+                skipped_dupe_count += 1
+                logger.info(f"  ↳ Duplicate historical ({title} @ {company}) — skipped | url: {url}")
+                continue
+
+            new_count += 1
+            logger.info(f"Analysing: {title} @ {company} | url: {url}")
+
+            result = analyze_job(title, company, desc)
+            if result is None:
+                continue
+
+            analysis, provider = result
+            score = analysis.get("fit_score", 0)
+
+            # Check if the role is a Ruby on Rails role and apply bias boost
+            desc_lower = desc.lower()
+            title_lower = title.lower()
+            has_ruby = "ruby" in desc_lower or "ruby" in title_lower
+            has_rails = "rails" in desc_lower or "rails" in title_lower
+            has_ror = "ror" in desc_lower or "ror" in title_lower
+            is_ror = (has_ruby and has_rails) or has_ror or ("ruby on rails" in desc_lower) or ("ruby on rails" in title_lower)
+
+            if is_ror and 0 < score < 8:
+                logger.info(f"  ↳ Python-side RoR boost: raising score from {score} to 8")
+                score = 8
+                analysis["fit_score"] = 8
+                analysis["why_it_fits"] = f"[RoR Boost Applied] {analysis.get('why_it_fits', '')}"
+
+            save_job(conn, url, title, company, score, provider)
+
+            if score >= FIT_THRESHOLD:
+                notified_count += 1
+                send_telegram(title, company, url, analysis, provider)
+            else:
+                logger.info(f"  ↳ Score {score}/10 — below threshold, skipped notify")
+        except Exception as e:
+            logger.error(f"❌ Error processing job '{title}' @ '{company}': {e}", exc_info=True)
             continue
-
-        if is_processed(conn, url):
-            processed_count += 1
-            continue
-
-        # Secondary dedup: same title+company already seen this run
-        tc_key = f"{title.lower()}||{company.lower()}"
-        if tc_key in seen_title_company:
-            skipped_dupe_count += 1
-            logger.info(f"  ↳ Duplicate in-run ({title} @ {company}) — skipped | url: {url}")
-            continue
-        seen_title_company.add(tc_key)
-
-        new_count += 1
-        logger.info(f"Analysing: {title} @ {company} | url: {url}")
-
-        result = analyze_job(title, company, desc)
-        if result is None:
-            continue
-
-        analysis, provider = result
-        score = analysis.get("fit_score", 0)
-
-        save_job(conn, url, title, company, score, provider)
-
-        if score >= FIT_THRESHOLD:
-            notified_count += 1
-            send_telegram(title, company, url, analysis, provider)
-        else:
-            logger.info(f"  ↳ Score {score}/10 — below threshold, skipped notify")
 
     conn.close()
     logger.info("─" * 55)

@@ -63,7 +63,7 @@ jobs:
       # This keeps the deduplication database persistent across runs
       # without committing it to git.
       - name: Restore jobs.db cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: jobs.db
           key: jobs-db-${{ github.run_id }}
@@ -83,5 +83,11 @@ jobs:
         run: python job_hunter.py
 
       # ── 6. Save updated jobs.db to cache ─────────────────────────────────
-      # The cache@v4 step above automatically saves after the job ends.
-      # No explicit save step needed.
+      # Save cache regardless of success or failure of previous steps to avoid
+      # notifying already-processed jobs on retry.
+      - name: Save jobs.db cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: jobs.db
+          key: jobs-db-${{ github.run_id }}
