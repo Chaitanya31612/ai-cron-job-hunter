@@ -183,20 +183,13 @@ class AIAnalyzerFactory:
                 logger.info(f"✅ Success with {provider_label}")
                 return response
 
-            # Only cascade on rate-limit signals; hard-fail on other errors
-            if cls._is_rate_limit_error(response.error or ""):
-                logger.warning(
-                    f"⚠️  Rate limit hit on {provider_label}. "
-                    f"Falling back to next provider..."
-                )
-                last_response = response
-                continue
-            else:
-                # Non-rate-limit error — return immediately, do not cascade
-                logger.error(
-                    f"❌ Non-rate-limit error from {provider_label}: {response.error}"
-                )
-                return response
+            # Fall back to the next provider/model on any error (rate limit, 404, auth error, etc.)
+            logger.warning(
+                f"⚠️  Error from {provider_label}: {response.error or 'Unknown error'}. "
+                f"Falling back to next provider..."
+            )
+            last_response = response
+            continue
 
         # All providers exhausted
         logger.error("❌ All providers exhausted or rate-limited.")

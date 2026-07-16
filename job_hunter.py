@@ -77,21 +77,31 @@ TELEGRAM_CHAT_ID_LOW   = os.getenv("TELEGRAM_CHAT_ID_LOW", "")
 # ─────────────────────────────────────────────
 # Pre-filter  (keyword-based fast-reject)
 # Runs BEFORE any LLM call — costs zero tokens.
-# If a job description contains any REJECT keyword, it's scored 0 and skipped.
-# If it contains NONE of the REQUIRE_ANY keywords, it's also skipped.
 # Saves ~25-40% of LLM calls on a typical run.
 # ─────────────────────────────────────────────
+# Title-based hard rejects: indicators of seniority checked only in the title
+TITLE_REJECT_KEYWORDS = [
+    r"principal\b", r"architect\b", r"manager\b", r"director\b",
+    r"staff\b", r"distinguished\b",
+]
+
+# General rejects: reject if found in title OR description (wrong stack, wrong domain, AI, YOE)
 REJECT_KEYWORDS = [
     # Wrong stack
-    r"\.net\b", r"\bc#\b", r"asp\.net", r"\bdjango\b", r"\bflask\b",
+    r"\.net\b", r"\bc#\b", r"\bcsharp\b", r"\basp\.net\b", r"\bdjango\b", r"\bflask\b",
     r"\bfastapi\b", r"\blaravel\b", r"\bphp\b",
-    # Wrong domain
-    r"data scientist", r"machine learning engineer", r"ml engineer",
-    r"devops engineer", r"\bsre\b", r"site reliability",
-    r"embedded engineer", r"firmware engineer",
-    r"android developer", r"ios developer", r"mobile developer",
-    # Too senior
+    # Wrong domain / mobile
+    r"\bdevops\b", r"\bsre\b", r"site\s+reliability", r"infrastructure\b", r"platform\s+engineer",
+    r"embedded", r"firmware",
+    r"android\b", r"ios\b", r"mobile\b", r"flutter\b", r"react\s+native\b",
+    # AI / ML / Data Science (AI Roles)
+    r"\bai\b", r"\bgen.?ai\b", r"generative\s+ai", r"artificial\s+intelligence",
+    r"\bllm\b", r"agent\s+systems?", r"\bml\b", r"machine\s+learning",
+    r"deep\s+learning", r"\bnlp\b", r"computer\s+vision",
+    r"data\s+scientist", r"data\s+science",
+    # Too senior YOE
     r"8\+\s*years?", r"10\+\s*years?", r"12\+\s*years?", r"15\+\s*years?",
+    r"8\+\s*yoe\b", r"10\+\s*yoe\b", r"12\+\s*yoe\b", r"15\+\s*yoe\b",
 ]
 
 REQUIRE_ANY_KEYWORDS = [
@@ -165,17 +175,25 @@ def quick_filter(title: str, company: str, description: str) -> tuple[bool, str]
     Fast keyword-based pre-screen before spending an LLM call.
     Returns (should_analyse, reason).
     """
-    text = (title + " " + description).lower()
+    title_lower = title.lower()
+    desc_lower = description.lower()
+    text = (title_lower + " " + desc_lower)
 
-    # Still respect hard reject keywords (wrong stack, wrong domain, too senior)
+    # 1. General rejects (checked anywhere in title or description)
     for pattern in REJECT_KEYWORDS:
         if re.search(pattern, text):
-            return False, f"pre-filter reject: '{pattern}'"
+            return False, f"pre-filter reject (general): '{pattern}'"
 
-    # Bypass tech keyword check if the company is recognized as valuable/tier-1/2/3
+    # 2. Title-based rejects
+    for pattern in TITLE_REJECT_KEYWORDS:
+        if re.search(pattern, title_lower):
+            return False, f"pre-filter reject (title): '{pattern}'"
+
+    # 3. Bypass tech keyword check if the company is recognized as valuable/tier-1/2/3
     if is_valuable_company(company):
         return True, "passed (valuable company bypass)"
 
+    # 4. Require at least one relevant tech keyword in title/description
     if not any(re.search(kw, text) for kw in REQUIRE_ANY_KEYWORDS):
         return False, "pre-filter reject: no relevant tech keywords found"
 
@@ -190,7 +208,7 @@ def quick_filter(title: str, company: str, description: str) -> tuple[bool, str]
 # A 4s floor keeps us comfortably under the 15 RPM ceiling.
 # ─────────────────────────────────────────────
 _last_llm_call: float = 0.0
-LLM_MIN_INTERVAL_SEC = 4.0   # seconds between LLM calls
+LLM_MIN_INTERVAL_SEC = 5.0   # seconds between LLM calls
 
 
 def rate_limited_analyze(content: str, prompt: str):
@@ -249,11 +267,10 @@ USER_PROFILE = {
         "Kubernetes, and LLM pipelines on the job."
     ),
 
-    # ── What to EXCLUDE ─────────────────────────────────────────────────────
     "avoid": [
         "Python-only roles (e.g. Django, Flask, FastAPI full-stack)",
         ".NET / C# roles",
-        "Data Science / ML Engineer roles",
+        "Data Science / ML / AI / GenAI / LLM / Agent roles",
         "DevOps / SRE-only roles",
         "Embedded / firmware roles",
         "More than 5 YOE explicitly required",
@@ -582,16 +599,16 @@ Return ONLY a valid JSON object — no markdown, no preamble:
 """
 
 
-def analyze_job(title: str, company: str, description: str) -> tuple | None:
+def analyze_job(title: str, company: str, description: str) -> tuple:
     if not description or len(description.strip()) < 50:
         logger.warning(f"Skipping '{title}' — description too short or missing")
-        return None
+        return None, "too_short"
 
     # Pre-filter: keyword check before spending any LLM tokens
     ok, reason = quick_filter(title, company, description)
     if not ok:
         logger.info(f"  ↳ {reason} — skipped LLM")
-        return None
+        return None, f"pre-filter: {reason}"
 
     job_content = f"Job Title: {title}\nCompany: {company}\n\nJob Description:\n{description}"
 
@@ -602,7 +619,7 @@ def analyze_job(title: str, company: str, description: str) -> tuple | None:
 
     if not response.success:
         logger.error(f"LLM failed for '{title}': {response.error}")
-        return None
+        return None, f"llm_failed: {response.error}"
 
     try:
         raw = response.content.strip()
@@ -615,7 +632,7 @@ def analyze_job(title: str, company: str, description: str) -> tuple | None:
         return json.loads(raw), response.provider.value
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse error for '{title}': {e}\nRaw: {response.content[:300]}")
-        return None
+        return None, "json_failed"
 
 
 # ─────────────────────────────────────────────
@@ -696,6 +713,45 @@ def send_telegram(title: str, company: str, url: str,
         logger.error(f"Telegram send failed ({channel}): {e}")
 
 
+def send_summary_telegram(
+    scraped: int,
+    already_seen: int,
+    dupes: int,
+    rejected: int,
+    llm_success: int,
+    llm_failed: int,
+    high: int,
+    regular: int,
+    below: int
+) -> None:
+    """Sends a summary message to Telegram at the end of the processing run."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID_HIGH:
+        logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID_HIGH not set — skipping summary notification")
+        return
+
+    text = (
+        f"📊 *AI Job Hunter Run Summary*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 *Scraped Listings:* {scraped}\n"
+        f"🔄 *Already Seen:* {already_seen}\n"
+        f"👯 *Duplicates Skipped:* {dupes}\n"
+        f"🚫 *Pre-Filter Rejected:* {rejected}\n"
+        f"🧠 *LLM Runs:* {llm_success} (failed: {llm_failed})\n\n"
+        f"📈 *LLM Score Outcomes:*\n"
+        f"  🔥 *High Priority (8+):* {high}\n"
+        f"  👀 *Regular Priority (6-7):* {regular}\n"
+        f"  💤 *Below Threshold (<6):* {below}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📬 *Total Notifications Sent:* {high + regular}"
+    )
+
+    try:
+        _post_telegram(TELEGRAM_CHAT_ID_HIGH, text, "Summary Message", "N/A")
+        logger.info("📬 Telegram run summary sent successfully")
+    except Exception as e:
+        logger.error(f"Telegram summary send failed: {e}")
+
+
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
@@ -710,9 +766,20 @@ def main() -> None:
     if jobs_df.empty:
         logger.info("No jobs returned this run. Exiting.")
         conn.close()
+        send_summary_telegram(0, 0, 0, 0, 0, 0, 0, 0, 0)
         return
 
-    new_count = processed_count = notified_count = skipped_dupe_count = 0
+    scraped_count = len(jobs_df)
+    already_seen_count = 0
+    skipped_dupe_count = 0
+    pre_filter_reject_count = 0
+    llm_success_count = 0
+    llm_failed_count = 0
+    high_priority_count = 0
+    regular_priority_count = 0
+    below_threshold_count = 0
+
+    new_count = processed_count = notified_count = 0
 
     # In-run dedup by (title, company) — catches same job posted under
     # different URLs (e.g. same Scoutit role on LinkedIn vs Indeed, or
@@ -730,6 +797,7 @@ def main() -> None:
                 continue
 
             if is_processed(conn, url):
+                already_seen_count += 1
                 processed_count += 1
                 continue
 
@@ -751,19 +819,26 @@ def main() -> None:
             logger.info(f"Analysing: {title} @ {company} | url: {url}")
 
             result = analyze_job(title, company, desc)
-            if result is None:
+            analysis, provider_or_reason = result
+            if analysis is None:
+                if "pre-filter:" in provider_or_reason:
+                    pre_filter_reject_count += 1
+                elif provider_or_reason != "too_short":
+                    llm_failed_count += 1
                 continue
 
-            analysis, provider = result
+            llm_success_count += 1
+            provider = provider_or_reason
             score = analysis.get("fit_score", 0)
 
             # Check if the role is a Ruby on Rails role and apply bias boost
             desc_lower = desc.lower()
             title_lower = title.lower()
-            has_ruby = "ruby" in desc_lower or "ruby" in title_lower
-            has_rails = "rails" in desc_lower or "rails" in title_lower
-            has_ror = "ror" in desc_lower or "ror" in title_lower
-            is_ror = (has_ruby and has_rails) or has_ror or ("ruby on rails" in desc_lower) or ("ruby on rails" in title_lower)
+            has_ruby = bool(re.search(r"\bruby\b", desc_lower) or re.search(r"\bruby\b", title_lower))
+            has_rails = bool(re.search(r"\brails\b", desc_lower) or re.search(r"\brails\b", title_lower))
+            has_ror = bool(re.search(r"\bror\b", desc_lower) or re.search(r"\bror\b", title_lower))
+            has_ruby_on_rails = bool(re.search(r"\bruby\s+on\s+rails\b", desc_lower) or re.search(r"\bruby\s+on\s+rails\b", title_lower))
+            is_ror = has_ruby or has_rails or has_ror or has_ruby_on_rails
 
             if is_ror and 0 < score < 8:
                 logger.info(f"  ↳ Python-side RoR boost: raising score from {score} to 8")
@@ -775,8 +850,13 @@ def main() -> None:
 
             if score >= FIT_THRESHOLD:
                 notified_count += 1
+                if score >= 8:
+                    high_priority_count += 1
+                else:
+                    regular_priority_count += 1
                 send_telegram(title, company, url, analysis, provider)
             else:
+                below_threshold_count += 1
                 logger.info(f"  ↳ Score {score}/10 — below threshold, skipped notify")
         except Exception as e:
             logger.error(f"❌ Error processing job '{title}' @ '{company}': {e}", exc_info=True)
@@ -791,6 +871,18 @@ def main() -> None:
         f"{notified_count} notifications sent"
     )
     logger.info("=" * 55)
+
+    send_summary_telegram(
+        scraped=scraped_count,
+        already_seen=already_seen_count,
+        dupes=skipped_dupe_count,
+        rejected=pre_filter_reject_count,
+        llm_success=llm_success_count,
+        llm_failed=llm_failed_count,
+        high=high_priority_count,
+        regular=regular_priority_count,
+        below=below_threshold_count,
+    )
 
 
 if __name__ == "__main__":

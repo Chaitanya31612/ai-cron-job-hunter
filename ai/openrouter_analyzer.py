@@ -20,7 +20,8 @@ class OpenRouterAnalyzer(AIAnalyzerInterface):
     # Ordered list of free models — tried top-to-bottom on failure
     FREE_MODELS = [
         "meta-llama/llama-3.3-70b-instruct:free",   # Primary: strong 70B reasoning
-        "openai/gpt-oss-120b:free",                  # Fallback: massive 120B model
+        "google/gemma-4-31b-it:free",                # Fallback: strong Google model
+        "qwen/qwen3-coder:free",                      # Coding/reasoning model
     ]
 
     def __init__(self, model: str = None):
@@ -31,6 +32,7 @@ class OpenRouterAnalyzer(AIAnalyzerInterface):
         self.client = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
+            max_retries=0,
             default_headers={
                 # Required by OpenRouter: identifies your app in their dashboard
                 "HTTP-Referer": "https://github.com/ai-job-hunter",

@@ -18,7 +18,7 @@ class GroqAnalyzer(AIAnalyzerInterface):
         if not api_key:
             raise ValueError("GROQ_API_KEY not found in environment")
 
-        self.client = Groq(api_key=api_key)
+        self.client = Groq(api_key=api_key, max_retries=0)
         self._model = self.MODELS.get(model, model)
         self._provider = AIProvider.GROQ
 
